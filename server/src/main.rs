@@ -3,7 +3,7 @@ use std::io::{ErrorKind, IoSliceMut};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::str;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bytes::{Bytes, BytesMut};
 use mio::{net::UdpSocket, Events, Interest, Poll, Token};
@@ -38,6 +38,11 @@ fn main() {
     let mut sock_mio = UdpSocket::bind(addr).unwrap();
     let sock_quic = UdpSocketState::new((&sock_mio).into()).unwrap();
 
+    #[cfg(target_os = "windows")]
+    sock_quic.set_gro((&sock_mio).into(), true).unwrap();
+    #[cfg(target_os = "linux")]
+    sock_quic.set_enable_rx_timestamps((&sock_mio).into(), true).unwrap();
+
     poll.registry()
         .register(&mut sock_mio, Token(0), Interest::READABLE)
         .unwrap();
@@ -67,11 +72,18 @@ fn main() {
         poll.poll(&mut events, next_timeout).unwrap();
 
         let now = Instant::now();
+        let sys_now: Duration = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
 
         while events.is_empty() == false {
             match sock_mio.try_io(|| sock_quic.recv((&sock_mio).into(), &mut iovs, &mut metas)) {
                 Ok(count) => {
                     for (meta, buf) in metas.iter().zip(iovs.iter()).take(count) {
+                        // Offset the receipt time by the packet timestamp
+                        let now = match meta.timestamp {
+                            Some(rx) => now - sys_now.saturating_sub(rx),
+                            None => now,
+                        };
+
                         let mut data: BytesMut = buf[0..meta.len].into();
                         while data.is_empty() == false {
                             let buf = data.split_to(meta.stride.min(data.len()));
@@ -92,14 +104,22 @@ fn main() {
         //for (connection_handle, mut datagrams) in server.incoming() {
         for (connection_handle, connection) in server.connections.iter_mut() {
             let rtt = connection.rtt();
+            let tx_bytes = connection.stats().udp_tx.bytes;
             let mut datagrams = connection.datagrams();
+            let mut should_ping = false;
             while let Some(bytes) = datagrams.recv() {
                 println!(
-                    "received datagram '{}' from {:?} (rtt: {})",
+                    "received datagram '{}' from {:?} (rtt: {}, tx: {})",
                     str::from_utf8(&bytes).unwrap(),
                     connection_handle,
                     rtt.as_millis(),
+                    tx_bytes
                 );
+                should_ping = true;
+            }
+
+            if should_ping {
+                connection.ping();
             }
         }
 
@@ -160,7 +180,7 @@ impl Server {
 
         self.prepare_response_buf();
 
-        self.connections.retain(|connection_handle, connection| {
+        for (connection_handle, connection) in &mut self.connections {
             connection.handle_timeout(now);
 
             for (_, mut events) in self.connection_events.drain() {
@@ -179,15 +199,14 @@ impl Server {
 
                 self.response_buf.clear(); // Need to clear here to reuse the buffer
             }
-
-            if connection.is_drained() {
-                println!("connection {:?} drained", connection_handle);
-            }
-
-            connection.is_drained() == false
-        });
+        }
 
         for (connection_handle, event) in self.endpoint_events.drain(..) {
+            if event.is_drained() {
+                println!("disconnecting: {:?}", connection_handle);
+                self.connections.remove(&connection_handle);
+            }
+
             if let Some(event) = self.endpoint.handle_event(connection_handle, event) {
                 if let Some(connection) = self.connections.get_mut(&connection_handle) {
                     connection.handle_event(event);
@@ -299,6 +318,9 @@ fn configure_server() -> Result<(ServerConfig, CertificateDer<'static>), rustls:
 
     let mut server_config =
         ServerConfig::with_single_cert(vec![cert_der.clone()], private_key.into())?;
+
+    let mut ack_frequency_config = AckFrequencyConfig::default();
+    ack_frequency_config.max_ack_delay(Some(Duration::from_millis(50)));
 
     let transport_config = Arc::get_mut(&mut server_config.transport).unwrap();
     transport_config.max_concurrent_uni_streams(0_u8.into());

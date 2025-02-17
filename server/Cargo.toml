@@ -8,8 +8,12 @@ workspace = true
 
 [dependencies]
 mio = {  version = "1.0", features = ["net", "os-poll"] }
-quinn-proto = "0.11"
-quinn-udp = "0.5"
+#quinn-proto = "0.11"
+#quinn-udp = "0.5"
+
+quinn-proto = { git = "https://github.com/recatek/quinn", branch = "udp-timestamp" }
+quinn-udp = { git = "https://github.com/recatek/quinn", branch = "udp-timestamp" }
+
 bytes = "1.10"
 rustls = "0.23"
 rcgen = "0.13"
