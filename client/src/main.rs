@@ -10,14 +10,12 @@ use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error + Send + Sync + 'static>>  {
     rustls::crypto::ring::default_provider().install_default().unwrap();
-
-    let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 53423);
-    run_client(addr).await?;
+    run_client().await?;
     Ok(())
 }
 
-async fn run_client(server_addr: SocketAddr) -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
-    let mut endpoint = Endpoint::client(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))?;
+async fn run_client() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
+    let mut endpoint = Endpoint::client(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0))?;
 
     endpoint.set_default_client_config(ClientConfig::new(Arc::new(QuicClientConfig::try_from(
         rustls::ClientConfig::builder()
@@ -28,16 +26,17 @@ async fn run_client(server_addr: SocketAddr) -> Result<(), Box<dyn Error + Send 
 
     // connect to server
     let connection = endpoint
-        .connect(server_addr, "localhost")
+        .connect(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 53423), "localhost")
         .unwrap()
         .await
         .unwrap();
 
     println!("connected to {}", connection.remote_address());
 
-    for x in 0..2 {
+    for x in 0..1000 {
+        println!("sending 'datagram #{}'", x);
         connection.send_datagram(Bytes::from(format!("datagram #{}", x))).unwrap();
-        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
     }
 
     // Dropping handles allows the corresponding objects to automatically shut down

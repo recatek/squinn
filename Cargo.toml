@@ -5,3 +5,6 @@ members = [
     "client",
 	"server",
 ]
+
+[workspace.lints.clippy]
+bool_comparison = "allow"

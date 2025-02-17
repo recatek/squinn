@@ -1,17 +1,23 @@
 use std::collections::{HashMap, VecDeque};
-use std::io;
-use std::str;
+use std::io::{ErrorKind, IoSliceMut};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::str;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bytes::{Bytes, BytesMut};
 use mio::{net::UdpSocket, Events, Interest, Poll, Token};
 use quinn_proto::*;
+use quinn_udp::{RecvMeta, UdpSocketState};
 use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
 
 /// The maximum of datagrams a Server will produce via `poll_transmit`
 const MAX_DATAGRAMS: usize = 10;
+
+#[cfg(target_os = "linux")]
+const BATCH_COUNT: usize = 32;
+#[cfg(target_os = "windows")]
+const BATCH_COUNT: usize = 1;
 
 pub struct Server {
     endpoint: Endpoint,
@@ -20,20 +26,20 @@ pub struct Server {
     connection_events: HashMap<ConnectionHandle, VecDeque<ConnectionEvent>>,
     endpoint_events: Vec<(ConnectionHandle, EndpointEvent)>,
 
-    byte_buf: Vec<u8>, // Reusable byte buffer to save on allocations
+    response_buf: Vec<u8>, // Reusable byte buffer to save on allocations
 }
 
 fn main() {
-    let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 53423);
+    let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 53423);
 
-    let mut recv_buf = [0_u8; 8192];
     let mut poll = Poll::new().unwrap();
     let mut events = Events::with_capacity(64);
 
-    let mut socket = UdpSocket::bind(addr).unwrap();
+    let mut sock_mio = UdpSocket::bind(addr).unwrap();
+    let sock_quic = UdpSocketState::new((&sock_mio).into()).unwrap();
 
     poll.registry()
-        .register(&mut socket, Token(0), Interest::READABLE)
+        .register(&mut sock_mio, Token(0), Interest::READABLE)
         .unwrap();
 
     let endpoint_config = EndpointConfig::default();
@@ -50,57 +56,84 @@ fn main() {
         connections: HashMap::new(),
         connection_events: HashMap::new(),
         endpoint_events: Vec::new(),
-        byte_buf: Vec::new(),
+        response_buf: Vec::new(),
     };
 
+    let max_udp_payload_size = server.endpoint.config().get_max_udp_payload_size() as usize;
+    let (mut iovs, mut metas) = create_buffers(sock_quic.gro_segments(), max_udp_payload_size);
+
     loop {
-        poll.poll(&mut events, server.compute_next_timeout()).unwrap();
+        let next_timeout = server.compute_next_timeout();
+        poll.poll(&mut events, next_timeout).unwrap();
 
         let now = Instant::now();
 
-        while !events.is_empty() {
-            match socket.recv_from(&mut recv_buf) {
-                Ok((len, remote)) => {
-                    println!("recv: {}B", len);
-                    server.handle_recv(now, remote, BytesMut::from(&recv_buf[..len]))
+        while events.is_empty() == false {
+            match sock_mio.try_io(|| sock_quic.recv((&sock_mio).into(), &mut iovs, &mut metas)) {
+                Ok(count) => {
+                    for (meta, buf) in metas.iter().zip(iovs.iter()).take(count) {
+                        let mut data: BytesMut = buf[0..meta.len].into();
+                        while data.is_empty() == false {
+                            let buf = data.split_to(meta.stride.min(data.len()));
+                            println!("recv: {}B", buf.len());
+                            server.handle_recv(now, meta, buf)
+                        }
+                    }
                 }
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
-                Err(e) if e.kind() == io::ErrorKind::ConnectionReset => (),
-                Err(e) => panic!("recv_from err: {:?}", e),
-            };
+                Err(e) if e.kind() == ErrorKind::WouldBlock => break,
+                Err(e) if e.kind() == ErrorKind::ConnectionReset => continue,
+                Err(e) => panic!("recv error: {:?}", e),
+            }
         }
 
         server.handle_process(now);
 
         // Get all the datagrams and do stuff with them
-        for (connection_handle, mut datagrams) in server.incoming() {
+        //for (connection_handle, mut datagrams) in server.incoming() {
+        for (connection_handle, connection) in server.connections.iter_mut() {
+            let rtt = connection.rtt();
+            let mut datagrams = connection.datagrams();
             while let Some(bytes) = datagrams.recv() {
                 println!(
-                    "received datagram '{}' from {:?}",
+                    "received datagram '{}' from {:?} (rtt: {})",
                     str::from_utf8(&bytes).unwrap(),
-                    connection_handle
+                    connection_handle,
+                    rtt.as_millis(),
                 );
             }
         }
 
-        // Send all the outgoing traffic -- TODO: Could be sendmmsg
-        for (packet, buffer) in server.outgoing() {
+        // Send all the outgoing traffic
+        for (transmit, buffer) in server.outgoing() {
+            let transmit = quinn_udp::Transmit {
+                destination: transmit.destination,
+                ecn: transmit.ecn.map(udp_ecn),
+                contents: &buffer,
+                segment_size: transmit.segment_size,
+                src_ip: transmit.src_ip,
+            };
+
             println!("send: {}B", buffer.len());
-            if let Err(e) = socket.send_to(&buffer, packet.destination) {
-                println!("send_to err: {:?}", e);
+            match sock_mio.try_io(|| sock_quic.try_send((&sock_mio).into(), &transmit)) {
+                Ok(()) => (),
+                Err(e) => println!("send error: {:?}", e),
             }
         }
     }
 }
 
 impl Server {
-    pub fn handle_recv(&mut self, now: Instant, remote: SocketAddr, data: BytesMut) {
-        self.prepare_byte_buf();
+    pub fn handle_recv(&mut self, now: Instant, meta: &RecvMeta, data: BytesMut) {
+        self.prepare_response_buf();
 
-        // REVIEW: What do I do with the local IP and ECN arguments here?
-        let event = self
-            .endpoint
-            .handle(now, remote, None, None, data, &mut self.byte_buf);
+        let event = self.endpoint.handle(
+            now,
+            meta.addr,
+            meta.dst_ip,
+            meta.ecn.map(proto_ecn),
+            data,
+            &mut self.response_buf,
+        );
 
         match event {
             Some(DatagramEvent::NewConnection(incoming)) => {
@@ -115,7 +148,7 @@ impl Server {
                     .push_back(event);
             }
             Some(DatagramEvent::Response(transmit)) => {
-                let send_buf = &self.byte_buf[..transmit.size];
+                let send_buf = &self.response_buf[..transmit.size];
                 self.outbound.extend(split_transmit(transmit, send_buf));
             }
             _ => {} // There may be no event to handle
@@ -125,7 +158,7 @@ impl Server {
     pub fn handle_process(&mut self, now: Instant) {
         let max = MAX_DATAGRAMS;
 
-        self.prepare_byte_buf();
+        self.prepare_response_buf();
 
         self.connections.retain(|connection_handle, connection| {
             connection.handle_timeout(now);
@@ -140,18 +173,17 @@ impl Server {
                 self.endpoint_events.push((*connection_handle, event));
             }
 
-            while let Some(transmit) = connection.poll_transmit(now, max, &mut self.byte_buf) {
-                let send_buf = &self.byte_buf[..transmit.size];
+            while let Some(transmit) = connection.poll_transmit(now, max, &mut self.response_buf) {
+                let send_buf = &self.response_buf[..transmit.size];
                 self.outbound.extend(split_transmit(transmit, send_buf));
 
-                self.byte_buf.clear(); // Need to clear here to reuse the buffer
+                self.response_buf.clear(); // Need to clear here to reuse the buffer
             }
 
             if connection.is_drained() {
                 println!("connection {:?} drained", connection_handle);
             }
 
-            // REVIEW: Is this the correct criterion to forget a connection?
             connection.is_drained() == false
         });
 
@@ -195,12 +227,13 @@ impl Server {
         now: Instant,
     ) -> Result<ConnectionHandle, ConnectionError> {
         // We don't need the original data and can reuse the buffer here.
-        self.byte_buf.clear();
+        self.response_buf.clear();
 
-        match self
+        let result = self
             .endpoint
-            .accept(incoming, now, &mut self.byte_buf, None)
-        {
+            .accept(incoming, now, &mut self.response_buf, None);
+
+        match result {
             Ok((connection_handle, connection)) => {
                 // Created a new connection -- store it in the hashmap
                 self.connections.insert(connection_handle, connection);
@@ -213,7 +246,7 @@ impl Server {
                 if let Some(transmit) = error.response {
                     let size = transmit.size;
                     self.outbound
-                        .extend(split_transmit(transmit, &self.byte_buf[..size]));
+                        .extend(split_transmit(transmit, &self.response_buf[..size]));
                 }
 
                 Err(error.cause)
@@ -221,12 +254,13 @@ impl Server {
         }
     }
 
-    fn prepare_byte_buf(&mut self) {
-        self.byte_buf.clear();
+    fn prepare_response_buf(&mut self) {
+        self.response_buf.clear();
 
         let max_size = self.endpoint.config().get_max_udp_payload_size() as usize;
-        if self.byte_buf.capacity() < max_size {
-            self.byte_buf.reserve(max_size - self.byte_buf.capacity());
+        if self.response_buf.capacity() < max_size {
+            self.response_buf
+                .reserve(max_size - self.response_buf.capacity());
         }
     }
 }
@@ -269,6 +303,41 @@ fn configure_server() -> Result<(ServerConfig, CertificateDer<'static>), rustls:
     let transport_config = Arc::get_mut(&mut server_config.transport).unwrap();
     transport_config.max_concurrent_uni_streams(0_u8.into());
     transport_config.max_idle_timeout(Some(IdleTimeout::from(VarInt::from_u32(10_000))));
+    transport_config.allow_spin(true);
 
     Ok((server_config, cert_der))
+}
+
+pub fn create_buffers(
+    gro_segments: usize,
+    max_udp_payload_size: usize,
+) -> ([IoSliceMut<'static>; BATCH_COUNT], [RecvMeta; BATCH_COUNT]) {
+    let chunk_size = gro_segments * max_udp_payload_size.min(u16::MAX.into());
+    let total_bytes = chunk_size * BATCH_COUNT;
+
+    let buf = Box::leak(vec![0; total_bytes].into_boxed_slice());
+    let mut chunks = buf.chunks_mut(chunk_size).map(IoSliceMut::new);
+
+    let iovs = std::array::from_fn(|_| chunks.next().unwrap());
+    let metas = [RecvMeta::default(); BATCH_COUNT];
+
+    (iovs, metas)
+}
+
+#[inline]
+fn proto_ecn(ecn: quinn_udp::EcnCodepoint) -> EcnCodepoint {
+    match ecn {
+        quinn_udp::EcnCodepoint::Ect0 => EcnCodepoint::Ect0,
+        quinn_udp::EcnCodepoint::Ect1 => EcnCodepoint::Ect1,
+        quinn_udp::EcnCodepoint::Ce => EcnCodepoint::Ce,
+    }
+}
+
+#[inline]
+fn udp_ecn(ecn: EcnCodepoint) -> quinn_udp::EcnCodepoint {
+    match ecn {
+        EcnCodepoint::Ect0 => quinn_udp::EcnCodepoint::Ect0,
+        EcnCodepoint::Ect1 => quinn_udp::EcnCodepoint::Ect1,
+        EcnCodepoint::Ce => quinn_udp::EcnCodepoint::Ce,
+    }
 }
