@@ -1,0 +1,14 @@
+[package]
+name = "client_bevy"
+version = "0.0.0"
+edition = "2021"
+
+[dependencies]
+bevy = "0.15"
+bevy_async_task = "0.4"
+
+url = "2.5"
+web-transport-wasm = "0.4"
+
+[lints]
+workspace = true

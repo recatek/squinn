@@ -3,7 +3,8 @@ resolver = "2"
 
 members = [
     "client",
-	"server",
+	"client_bevy",
+    "server_wtransport",
 ]
 
 [workspace.lints.clippy]
