@@ -1,18 +1,24 @@
 use std::collections::{HashMap, VecDeque};
-use std::io::IoSliceMut;
+use std::io::{Cursor, IoSliceMut};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bytes::{Bytes, BytesMut};
+use quinn_proto::crypto::rustls::QuicServerConfig;
 use quinn_proto::{
     AckFrequencyConfig, Connection, ConnectionError, ConnectionEvent, ConnectionHandle,
-    DatagramEvent, Datagrams, Endpoint, EndpointConfig, EndpointEvent, IdleTimeout, Incoming,
-    ServerConfig, Transmit, VarInt,
+    DatagramEvent, Datagrams, Dir, Endpoint, EndpointConfig, EndpointEvent, IdleTimeout, Incoming,
+    ServerConfig, StreamId, Transmit, VarInt,
 };
 use quinn_udp::RecvMeta;
-use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+use thiserror::Error;
+use web_transport_proto::{Settings as ProtoSettings, SettingsError as ProtoSettingsError};
 
 use crate::util;
+
+/// The HTTP/3 ALPN is required when negotiating a QUIC connection.
+pub const ALPN: &[u8] = b"h3";
 
 /// The maximum of datagrams a Server will produce via `poll_transmit`
 const MAX_DATAGRAMS: usize = 10;
@@ -39,19 +45,24 @@ pub struct Server {
 }
 
 impl Server {
-    pub fn new() -> Result<(Self, CertificateDer<'static>), rustls::Error> {
-        let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
-        let cert_der = CertificateDer::from(cert.cert);
-        let cert_der_vec = vec![cert_der.clone()];
-        let private_key = PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der());
+    pub fn new(
+        certs: Vec<CertificateDer<'static>>,
+        key: PrivateKeyDer<'static>,
+    ) -> Result<Self, rustls::Error> {
+        let mut server_config =
+            rustls::ServerConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
+                .with_no_client_auth()
+                .with_single_cert(certs, key)?;
+
+        server_config.alpn_protocols = vec![ALPN.to_vec()]; // Must set the proper protocol
 
         let endpoint_config = EndpointConfig::default();
-        let mut server_config = ServerConfig::with_single_cert(cert_der_vec, private_key.into())?;
+        let server_config: QuicServerConfig = server_config.try_into().unwrap();
+        let mut server_config = ServerConfig::with_crypto(Arc::new(server_config));
         let mut ack_frequency_config = AckFrequencyConfig::default();
         let transport_config = Arc::get_mut(&mut server_config.transport).unwrap();
 
         ack_frequency_config.max_ack_delay(Some(MAX_ACK_DELAY));
-        transport_config.max_concurrent_uni_streams(0_u8.into());
         transport_config.max_idle_timeout(Some(IdleTimeout::from(MAX_IDLE_TIMEOUT_MS)));
         transport_config.allow_spin(true);
 
@@ -69,7 +80,7 @@ impl Server {
             response_buf: Vec::new(),
         };
 
-        Ok((server, cert_der))
+        Ok(server)
     }
 
     pub fn create_buffers(
@@ -156,7 +167,7 @@ impl Server {
             }
 
             if let Some(event) = self.endpoint.handle_event(connection_handle, event) {
-                debug_assert_eq!(is_drained, false, "drained event yielded response");
+                debug_assert!(!is_drained, "drained event yielded response");
                 if let Some(connection) = self.connections.get_mut(&connection_handle) {
                     connection.handle_event(event);
                 }
@@ -170,7 +181,7 @@ impl Server {
         self.connections.iter_mut()
     }
 
-    pub fn incoming(&mut self) -> impl Iterator<Item = (ConnectionHandle, Datagrams<'_>)> {
+    pub fn _incoming(&mut self) -> impl Iterator<Item = (ConnectionHandle, Datagrams<'_>)> {
         self.connections
             .iter_mut()
             .map(|(connection_handle, connection)| (*connection_handle, connection.datagrams()))
@@ -265,3 +276,4 @@ fn split_transmit(transmit: Transmit, buffer: &[u8]) -> Vec<(Transmit, Bytes)> {
 
     transmits
 }
+

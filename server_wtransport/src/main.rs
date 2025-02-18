@@ -1,17 +1,23 @@
 mod server;
 mod util;
+mod settings;
 
-use std::io::ErrorKind;
+use std::fs::File;
+use std::io::{BufReader, ErrorKind};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::str;
-use std::time::{Instant, SystemTime};
+use std::time::Instant;
 
 use bytes::BytesMut;
 use mio::{net::UdpSocket, Events, Interest, Poll, Token};
 use quinn_udp::{Transmit, UdpSocketState};
 
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+
 #[cfg(target_os = "linux")]
 use quinn_udp::RecvTime;
+#[cfg(target_os = "linux")]
+use std::time::SystemTime;
 
 use crate::server::Server;
 
@@ -34,7 +40,8 @@ fn main() {
         .register(&mut sock_mio, Token(0), Interest::READABLE)
         .unwrap();
 
-    let (mut server, _cert) = Server::new().expect("failed to create server");
+    let (certs, key) = read_certs();
+    let mut server = Server::new(certs, key).expect("failed to create server");
     let (mut iovs, mut metas) = server.create_buffers(sock_quic.gro_segments());
 
     loop {
@@ -42,6 +49,7 @@ fn main() {
         poll.poll(&mut events, next_timeout).unwrap();
 
         let now = Instant::now();
+        #[cfg(target_os = "linux")]
         let sys_now = SystemTime::now();
 
         while events.is_empty() == false {
@@ -115,4 +123,23 @@ fn main() {
             }
         }
     }
+}
+
+fn read_certs() -> (Vec<CertificateDer<'static>>, PrivateKeyDer<'static>) {
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .expect("failed to install rustls crypto provider");
+
+    let certs = File::open("cert/localhost.crt").expect("failed to open cert file");
+    let key = File::open("cert/localhost.key").expect("failed to open key file");
+
+    let certs: Vec<CertificateDer> = rustls_pemfile::certs(&mut BufReader::new(certs))
+        .collect::<Result<_, _>>()
+        .expect("failed to load certs");
+    let key = rustls_pemfile::private_key(&mut BufReader::new(key))
+        .expect("failed to load private key")
+        .expect("missing private key");
+
+    assert!(!certs.is_empty(), "could not find certificate");
+    (certs, key)
 }
