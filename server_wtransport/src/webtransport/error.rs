@@ -8,8 +8,6 @@ pub enum WebTransportError {
     UnexpectedEnd,
     #[error("webtransport is not supported")]
     WebTransportUnsupported,
-    #[error("connect already finished")]
-    ConnectAlreadyFinished,
     #[error("not ready to respond")]
     NotReadyToRespond,
 

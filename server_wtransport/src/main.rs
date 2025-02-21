@@ -14,15 +14,12 @@ use quinn_udp::{Transmit, UdpSocketState};
 
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
-#[cfg(target_os = "linux")]
-use quinn_udp::RecvTime;
-#[cfg(target_os = "linux")]
-use std::time::SystemTime;
-
 use crate::server::Server;
 
 fn main() {
-    let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 53423);
+    simple_logger::init().unwrap();
+
+    let addr: SocketAddr = "[::]:4443".parse().unwrap();
 
     let mut poll = Poll::new().unwrap();
     let mut events = Events::with_capacity(64);
@@ -34,7 +31,7 @@ fn main() {
     #[cfg(target_os = "windows")]
     sock_quic.set_gro(sock_ref, true).unwrap();
     #[cfg(target_os = "linux")]
-    sock_quic.set_rx_timestamps(sock_ref, true).unwrap();
+    sock_quic.set_recv_timestamping(sock_ref, true).unwrap();
 
     poll.registry()
         .register(&mut sock_mio, Token(0), Interest::READABLE)
@@ -44,28 +41,17 @@ fn main() {
     let mut server = Server::new(certs, key).expect("failed to create server");
     let (mut iovs, mut metas) = server.create_buffers(sock_quic.gro_segments());
 
-    loop {
-        let next_timeout = server.compute_next_timeout();
-        poll.poll(&mut events, next_timeout).unwrap();
+    println!("listening on {}...", addr);
 
+    loop {
         let now = Instant::now();
-        #[cfg(target_os = "linux")]
-        let sys_now = SystemTime::now();
+        let next_timeout = server.compute_next_timeout().map(|t| t.saturating_duration_since(now));
+        poll.poll(&mut events, next_timeout).unwrap();
 
         while events.is_empty() == false {
             match sock_mio.try_io(|| sock_quic.recv((&sock_mio).into(), &mut iovs, &mut metas)) {
                 Ok(count) => {
                     for (meta, buf) in metas.iter().zip(iovs.iter()).take(count) {
-                        // Offset the receipt time by the packet timestamp
-                        let now = match meta.timestamp {
-                            #[cfg(target_os = "linux")]
-                            Some(RecvTime::Realtime(rx)) => match sys_now.duration_since(rx) {
-                                Ok(duration) => now - duration,
-                                Err(_) => now,
-                            },
-                            _ => now,
-                        };
-
                         let mut data: BytesMut = buf[0..meta.len].into();
                         while data.is_empty() == false {
                             let buf = data.split_to(meta.stride.min(data.len()));
@@ -85,6 +71,8 @@ fn main() {
         // Get all the datagrams and do stuff with them
         //for (connection_handle, mut datagrams) in server.incoming() {
         for (connection_handle, connection) in server.connections_mut() {
+            // TODO: Need to get/write the session ID for webtransport!
+
             let rtt = connection.rtt();
             let tx_bytes = connection.stats().udp_tx.bytes;
             let mut datagrams = connection.datagrams();

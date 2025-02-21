@@ -1,21 +1,22 @@
 use std::collections::{HashMap, VecDeque};
-use std::io::{Cursor, IoSliceMut};
+use std::io::IoSliceMut;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bytes::{Bytes, BytesMut};
+use http::StatusCode;
 use quinn_proto::crypto::rustls::QuicServerConfig;
 use quinn_proto::{
     AckFrequencyConfig, Connection, ConnectionError, ConnectionEvent, ConnectionHandle,
-    DatagramEvent, Datagrams, Dir, Endpoint, EndpointConfig, EndpointEvent, IdleTimeout, Incoming,
-    ServerConfig, StreamId, Transmit, VarInt,
+    DatagramEvent, Datagrams, Endpoint, EndpointConfig, EndpointEvent, FinishError, IdleTimeout,
+    Incoming, RecvStream, SendStream, ServerConfig, Transmit, VarInt,
 };
 use quinn_udp::RecvMeta;
-use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
-use thiserror::Error;
-use web_transport_proto::{Settings as ProtoSettings, SettingsError as ProtoSettingsError};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
 use crate::util;
+
+use crate::webtransport::{Request, RequestState};
 
 /// The HTTP/3 ALPN is required when negotiating a QUIC connection.
 pub const ALPN: &[u8] = b"h3";
@@ -37,11 +38,16 @@ const BATCH_COUNT: usize = 1;
 pub struct Server {
     endpoint: Endpoint,
     outbound: VecDeque<(Transmit, Bytes)>,
-    connections: HashMap<ConnectionHandle, Connection>,
+    connections: HashMap<ConnectionHandle, ConnectionWrapper>,
     connection_events: HashMap<ConnectionHandle, VecDeque<ConnectionEvent>>,
     endpoint_events: Vec<(ConnectionHandle, EndpointEvent)>,
 
-    response_buf: Vec<u8>, // Reusable byte buffer to save on allocations
+    buf: Vec<u8>, // Reusable byte buffer to save on allocations
+}
+
+struct ConnectionWrapper {
+    inner: Connection,
+    request: Request,
 }
 
 impl Server {
@@ -77,7 +83,7 @@ impl Server {
             connections: HashMap::new(),
             connection_events: HashMap::new(),
             endpoint_events: Vec::new(),
-            response_buf: Vec::new(),
+            buf: Vec::new(),
         };
 
         Ok(server)
@@ -109,7 +115,7 @@ impl Server {
             meta.dst_ip,
             meta.ecn.map(util::proto_ecn),
             data,
-            &mut self.response_buf,
+            &mut self.buf,
         );
 
         match event {
@@ -125,7 +131,7 @@ impl Server {
                     .push_back(event);
             }
             Some(DatagramEvent::Response(transmit)) => {
-                let send_buf = &self.response_buf[..transmit.size];
+                let send_buf = &self.buf[..transmit.size];
                 self.outbound.extend(split_transmit(transmit, send_buf));
             }
             _ => {} // There may be no event to handle
@@ -138,23 +144,50 @@ impl Server {
         self.prepare_response_buf();
 
         for (connection_handle, connection) in &mut self.connections {
-            connection.handle_timeout(now);
+            // TODO: Quinn does this after transmit (in a ping-pong between the two), see below...
+            connection.inner.handle_timeout(now);
 
             for (_, mut events) in self.connection_events.drain() {
                 for event in events.drain(..) {
-                    connection.handle_event(event);
+                    connection.inner.handle_event(event);
                 }
             }
 
-            while let Some(event) = connection.poll_endpoint_events() {
+            if connection.inner.is_drained() == false {
+                'wt: loop {
+                    println!("webtransport...");
+                    match connection.request.update(&mut connection.inner) {
+                        Ok(RequestState::ConnectData(url)) => {
+                            println!("got connect data: {:?}", url);
+                            _ = connection.request.respond(StatusCode::OK);
+                        }
+                        Ok(RequestState::ResponseSent(id)) => {
+                            println!("got stream id: {:?}", id);
+                            // TODO
+                        }
+                        Ok(RequestState::Finished) | Ok(RequestState::Waiting) => {
+                            // Nothing to do here
+                            break 'wt;
+                        }
+                        Err(e) => {
+                            println!("got error: {:?}", e);
+                            break 'wt;
+                        }
+                    }
+                }
+            }
+
+            while let Some(event) = connection.inner.poll_endpoint_events() {
                 self.endpoint_events.push((*connection_handle, event));
             }
 
-            while let Some(transmit) = connection.poll_transmit(now, max, &mut self.response_buf) {
-                let send_buf = &self.response_buf[..transmit.size];
+            // TODO: Transmit may reset timers, and timers may cause more to reset.
+            //       Look at the drive_timer function in quinn's connection.rs for more info.
+            while let Some(transmit) = connection.inner.poll_transmit(now, max, &mut self.buf) {
+                let send_buf = &self.buf[..transmit.size];
                 self.outbound.extend(split_transmit(transmit, send_buf));
 
-                self.response_buf.clear(); // Need to clear here to reuse the buffer
+                self.buf.clear(); // Need to clear here to reuse the buffer
             }
         }
 
@@ -169,7 +202,7 @@ impl Server {
             if let Some(event) = self.endpoint.handle_event(connection_handle, event) {
                 debug_assert!(!is_drained, "drained event yielded response");
                 if let Some(connection) = self.connections.get_mut(&connection_handle) {
-                    connection.handle_event(event);
+                    connection.inner.handle_event(event);
                 }
             }
         }
@@ -178,24 +211,26 @@ impl Server {
     pub fn connections_mut(
         &mut self,
     ) -> impl Iterator<Item = (&ConnectionHandle, &mut Connection)> {
-        self.connections.iter_mut()
+        self.connections.iter_mut().map(|(h, c)| (h, &mut c.inner))
     }
 
     pub fn _incoming(&mut self) -> impl Iterator<Item = (ConnectionHandle, Datagrams<'_>)> {
         self.connections
             .iter_mut()
-            .map(|(connection_handle, connection)| (*connection_handle, connection.datagrams()))
+            .map(|(connection_handle, connection)| {
+                (*connection_handle, connection.inner.datagrams())
+            })
     }
 
     pub fn outgoing(&mut self) -> impl Iterator<Item = (Transmit, Bytes)> + '_ {
         self.outbound.drain(..)
     }
 
-    pub fn compute_next_timeout(&mut self) -> Option<Duration> {
+    pub fn compute_next_timeout(&mut self) -> Option<Instant> {
         let mut min: Option<Instant> = None;
 
         for (_, connection) in self.connections.iter_mut() {
-            if let Some(timeout) = connection.poll_timeout().as_mut() {
+            if let Some(timeout) = connection.inner.poll_timeout().as_mut() {
                 match min.as_mut() {
                     Some(min) => *min = *min.min(timeout),
                     None => min = Some(*timeout),
@@ -203,7 +238,7 @@ impl Server {
             }
         }
 
-        min.and_then(|min| min.checked_duration_since(Instant::now()))
+        min
     }
 
     fn try_accept(
@@ -212,16 +247,21 @@ impl Server {
         now: Instant,
     ) -> Result<ConnectionHandle, ConnectionError> {
         // We don't need the original data and can reuse the buffer here.
-        self.response_buf.clear();
+        self.buf.clear();
 
-        let result = self
-            .endpoint
-            .accept(incoming, now, &mut self.response_buf, None);
+        let result = self.endpoint.accept(incoming, now, &mut self.buf, None);
 
         match result {
             Ok((connection_handle, connection)) => {
                 // Created a new connection -- store it in the hashmap
-                self.connections.insert(connection_handle, connection);
+                self.connections.insert(
+                    connection_handle,
+                    ConnectionWrapper {
+                        inner: connection,
+                        request: Request::new(),
+                    },
+                );
+
                 println!("accepted {:?}", connection_handle);
 
                 Ok(connection_handle)
@@ -231,7 +271,7 @@ impl Server {
                 if let Some(transmit) = error.response {
                     let size = transmit.size;
                     self.outbound
-                        .extend(split_transmit(transmit, &self.response_buf[..size]));
+                        .extend(split_transmit(transmit, &self.buf[..size]));
                 }
 
                 Err(error.cause)
@@ -240,12 +280,11 @@ impl Server {
     }
 
     fn prepare_response_buf(&mut self) {
-        self.response_buf.clear();
+        self.buf.clear();
 
         let max_size = self.endpoint.config().get_max_udp_payload_size() as usize;
-        if self.response_buf.capacity() < max_size {
-            self.response_buf
-                .reserve(max_size - self.response_buf.capacity());
+        if self.buf.capacity() < max_size {
+            self.buf.reserve(max_size - self.buf.capacity());
         }
     }
 }
@@ -277,3 +316,16 @@ fn split_transmit(transmit: Transmit, buffer: &[u8]) -> Vec<(Transmit, Bytes)> {
     transmits
 }
 
+// TODO: Wrap in connection?
+pub fn close_recv_stream(recv_stream: &mut RecvStream) {
+    _ = recv_stream.stop(0u32.into()); // Ignore ClosedStream errors
+}
+
+// TODO: Wrap in connection?
+pub fn close_send_stream(send_stream: &mut SendStream) {
+    match send_stream.finish() {
+        Ok(()) => (), // Everything worked fine
+        Err(FinishError::Stopped(reason)) => _ = send_stream.reset(reason),
+        Err(FinishError::ClosedStream) => (), // Already closed
+    }
+}

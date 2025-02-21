@@ -1,29 +1,28 @@
 use std::io::Cursor;
+use std::sync::LazyLock;
 
 use quinn_proto::{Connection, Dir, StreamId};
-use web_transport_proto::{Settings, SettingsError};
+use web_transport_proto::{Settings as SettingsData, SettingsError};
 
-use crate::webtransport::WebTransportError;
+use crate::webtransport::{WebTransportError};
+use crate::server::{close_send_stream, close_recv_stream};
 
-/// Pre-encoded settings frame with enable_webtransport set to 1.
-/// Validated in debug at runtime with check_settings_encoded().
-const SETTINGS_ENCODED: [u8; 31] = [
-    0, 4, 28, 171, 96, 55, 67, 1, 128, 255, 210, 119, 1, 8, 1, 51, 1, 192, 0, 0, 0, 198, 113, 112,
-    106, 1, 171, 96, 55, 66, 1,
-];
+// This never changes at runtime, but is nondeterministic due to being HashMap-based.
+const SETTINGS_ENCODED: LazyLock<&[u8]> = LazyLock::new(|| encode_settings());
 
 #[derive(Default)]
-pub struct SettingsState {
+pub struct Settings {
     send_done: bool,
-    send_id: Option<StreamId>,
-    send_bytes: usize,
-
     recv_done: bool,
+
+    send_id: Option<StreamId>,
     recv_id: Option<StreamId>,
+
+    send_bytes: usize,
 }
 
 #[allow(dead_code)]
-impl SettingsState {
+impl Settings {
     pub fn new() -> Self {
         Self::default()
     }
@@ -33,8 +32,6 @@ impl SettingsState {
         connection: &mut Connection,
         recv_buf: &mut Vec<u8>,
     ) -> Result<bool, WebTransportError> {
-        debug_assert!(check_settings_encoded());
-
         if self.send_done == false {
             self.send_done |= self.try_send(connection)?;
         }
@@ -59,7 +56,7 @@ impl SettingsState {
             self.send_bytes += send_stream.write(&SETTINGS_ENCODED[self.send_bytes..])?;
 
             if self.send_bytes >= SETTINGS_ENCODED.len() {
-                super::close_send_stream(&mut send_stream);
+                close_send_stream(&mut send_stream);
                 return Ok(true);
             }
         }
@@ -89,18 +86,18 @@ impl SettingsState {
 
             recv_buf.extend_from_slice(&recv_chunk.bytes);
 
-            return match Settings::decode(&mut Cursor::new(&recv_buf)) {
+            return match SettingsData::decode(&mut Cursor::new(&recv_buf)) {
                 Err(SettingsError::UnexpectedEnd) => Ok(false), // Keep trying
                 Err(e) => Err(e.into()), // No close -- we'll nuke the connection
 
                 // Got what we wanted here
                 Ok(settings) => {
-                    super::close_recv_stream(&mut recv_stream);
+                    close_recv_stream(&mut recv_stream);
                     match settings.supports_webtransport() {
                         0 => Err(WebTransportError::WebTransportUnsupported),
                         _ => Ok(true), // We're done!
                     }
-                },
+                }
             };
         }
 
@@ -108,12 +105,12 @@ impl SettingsState {
     }
 }
 
-fn check_settings_encoded() -> bool {
-    let mut settings = Settings::default();
+fn encode_settings() -> &'static [u8] {
+    let mut settings = SettingsData::default();
     settings.enable_webtransport(1);
 
     let mut buf = Vec::<u8>::new();
     settings.encode(&mut buf);
 
-    &buf == &SETTINGS_ENCODED
+    Box::leak(buf.into_boxed_slice())
 }

@@ -2,23 +2,17 @@ use std::io::Cursor;
 
 use quinn_proto::{Connection, Dir, StreamId};
 use url::Url;
-use web_transport_proto::{ConnectError, ConnectRequest, VarInt};
+use web_transport_proto::{ConnectError, ConnectRequest};
 
 use crate::webtransport::WebTransportError;
 
-pub struct ConnectData {
-    pub url: Url,
-    pub session_id: VarInt,
-    pub response_id: StreamId,
-}
-
 #[derive(Default)]
-pub struct ConnectState {
-    recv_id: Option<StreamId>,
+pub struct Connect {
+    stream_id: Option<StreamId>,
 }
 
 #[allow(dead_code)]
-impl ConnectState {
+impl Connect {
     pub fn new() -> Self {
         Self::default()
     }
@@ -27,12 +21,12 @@ impl ConnectState {
         &mut self,
         connection: &mut Connection,
         recv_buf: &mut Vec<u8>,
-    ) -> Result<Option<ConnectData>, WebTransportError> {
-        if self.recv_id.is_none() {
-            self.recv_id = connection.streams().accept(Dir::Bi); // For response
+    ) -> Result<Option<(Url, StreamId)>, WebTransportError> {
+        if self.stream_id.is_none() {
+            self.stream_id = connection.streams().accept(Dir::Bi); // For response
         }
 
-        if let Some(recv_id) = self.recv_id {
+        if let Some(recv_id) = self.stream_id {
             // We don't close on error since we'll just nuke the connection
             let mut recv_stream = connection.recv_stream(recv_id);
             let recv_chunk = recv_stream
@@ -49,12 +43,8 @@ impl ConnectState {
 
                 // Got what we wanted here
                 Ok(connect) => {
-                    super::close_recv_stream(&mut recv_stream); // Send still open
-                    Ok(Some(ConnectData {
-                        url: connect.url,
-                        session_id: VarInt::from_u64(recv_id.index()).unwrap(),
-                        response_id: recv_id,
-                    }))
+                    // The stream stays open for the duration of the connection
+                    Ok(Some((connect.url, recv_id)))
                 }
             };
         }
