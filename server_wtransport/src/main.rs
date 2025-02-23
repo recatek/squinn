@@ -1,5 +1,8 @@
+mod outbound;
 mod server;
+mod session;
 mod util;
+
 mod webtransport;
 
 use std::fs::File;
@@ -19,7 +22,7 @@ use crate::server::Server;
 fn main() {
     //simple_logger::init().unwrap();
 
-    let addr: SocketAddr = "[::]:4443".parse().unwrap();
+    let addr: SocketAddr = "127.0.0.1:4443".parse().unwrap();
 
     let mut poll = Poll::new().unwrap();
     let mut events = Events::with_capacity(64);
@@ -72,28 +75,33 @@ fn main() {
         server.handle_process(now);
 
         // Get all the datagrams and do stuff with them
-        //for (connection_handle, mut datagrams) in server.incoming() {
-        for (connection_handle, connection) in server.connections_mut() {
-            // TODO: Need to get/write the session ID for webtransport!
+        for (connection_handle, session) in server.sessions_mut() {
+            loop {
+                let bytes = match session.recv_datagram() {
+                    Ok(Some(bytes)) => bytes,
+                    Ok(None) => break,
 
-            let rtt = connection.rtt();
-            let tx_bytes = connection.stats().udp_tx.bytes;
-            let mut datagrams = connection.datagrams();
-            let mut should_ping = false;
+                    Err(e) => {
+                        println!("failed to recv datagram: {:?}", e);
+                        continue;
+                    }
+                };
 
-            while let Some(bytes) = datagrams.recv() {
                 println!(
-                    "received datagram '{}' from {:?} (rtt: {}, tx: {})",
+                    "echoing datagram '{}' from {:?}",
                     str::from_utf8(&bytes).unwrap(),
                     connection_handle,
-                    rtt.as_millis(),
-                    tx_bytes
                 );
-                should_ping = true;
-            }
 
-            if should_ping {
-                connection.ping();
+                let send = session.send_datagram(|buf| {
+                    buf[..bytes.len()].copy_from_slice(&bytes);
+                    bytes.len()
+                });
+
+                if let Err(e) = send {
+                    println!("failed to send datagram: {:?}", e);
+                    continue;
+                }
             }
         }
 

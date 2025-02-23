@@ -11,7 +11,7 @@ use bevy_async_task::AsyncTaskRunner;
 use url::Url;
 use web_transport_wasm::ClientBuilder;
 
-const SERVER_URL: &str = "https://localhost:4443";
+const SERVER_URL: &str = "https://127.0.0.1:4443";
 
 #[derive(Resource)]
 struct Client {

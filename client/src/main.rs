@@ -1,6 +1,6 @@
+use std::error::Error;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
-use std::error::Error;
 
 use bytes::Bytes;
 use quinn::*;
@@ -8,8 +8,10 @@ use quinn_proto::crypto::rustls::QuicClientConfig;
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn Error + Send + Sync + 'static>>  {
-    rustls::crypto::ring::default_provider().install_default().unwrap();
+async fn main() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .unwrap();
     run_client().await?;
     Ok(())
 }
@@ -26,7 +28,10 @@ async fn run_client() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
 
     // connect to server
     let connection = endpoint
-        .connect(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 53423), "localhost")
+        .connect(
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 53423),
+            "localhost",
+        )
         .unwrap()
         .await
         .unwrap();
@@ -35,7 +40,9 @@ async fn run_client() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
 
     for x in 0..1000 {
         println!("sending 'datagram #{}'", x);
-        connection.send_datagram(Bytes::from(format!("datagram #{}", x))).unwrap();
+        connection
+            .send_datagram(Bytes::from(format!("datagram #{}", x)))
+            .unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(30)).await;
     }
 

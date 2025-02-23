@@ -4,27 +4,21 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bytes::{Bytes, BytesMut};
-use http::StatusCode;
 use quinn_proto::crypto::rustls::QuicServerConfig;
 use quinn_proto::{
-    AckFrequencyConfig, Connection, ConnectionError, ConnectionHandle, DatagramEvent, Datagrams,
-    Endpoint, EndpointConfig, EndpointEvent, IdleTimeout, Incoming, ServerConfig, Transmit, VarInt,
+    AckFrequencyConfig, ConnectionError, ConnectionHandle, DatagramEvent, Endpoint, EndpointConfig,
+    EndpointEvent, IdleTimeout, Incoming, ServerConfig, Transmit, VarInt,
 };
 use quinn_udp::RecvMeta;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
+use crate::outbound::Outbound;
+use crate::session::Session;
 use crate::util;
-
-use crate::webtransport::{Request, RequestState};
+use crate::webtransport::Request;
 
 /// The HTTP/3 ALPN is required when negotiating a QUIC connection.
 pub const ALPN: &[u8] = b"h3";
-
-/// The maximum of datagrams a Server will produce via `poll_transmit`
-const MAX_DATAGRAMS: usize = 10;
-
-/// The maximum number of transmit loop iterations for a single connection.
-const MAX_TRANSMIT_OPS: usize = 3;
 
 /// Maximum ack delay (adjust for longer periods between recv calls).
 const MAX_ACK_DELAY: Duration = Duration::from_millis(50);
@@ -39,16 +33,11 @@ const BATCH_COUNT: usize = 1;
 
 pub struct Server {
     endpoint: Endpoint,
-    outbound: Vec<(Transmit, Bytes)>,
-    connections: HashMap<ConnectionHandle, ConnectionWrapper>,
+    outbound: Outbound,
+    connections: HashMap<ConnectionHandle, Session>,
     endpoint_events: Vec<(ConnectionHandle, EndpointEvent)>,
 
     buf: Vec<u8>, // Reusable byte buffer to save on allocations
-}
-
-struct ConnectionWrapper {
-    inner: Connection,
-    request: Request,
 }
 
 impl Server {
@@ -80,7 +69,7 @@ impl Server {
                 true,
                 None,
             ),
-            outbound: Vec::new(),
+            outbound: Outbound::new(),
             connections: HashMap::new(),
             endpoint_events: Vec::new(),
             buf: Vec::new(),
@@ -132,7 +121,7 @@ impl Server {
                 }
             }
             Some(DatagramEvent::Response(transmit)) => {
-                push_transmit(transmit, &mut self.buf, &mut self.outbound);
+                self.outbound.push(transmit, &mut self.buf);
             }
             _ => {} // There may be no event to handle
         }
@@ -166,22 +155,12 @@ impl Server {
         }
     }
 
-    pub fn connections_mut(
-        &mut self,
-    ) -> impl Iterator<Item = (&ConnectionHandle, &mut Connection)> {
-        self.connections.iter_mut().map(|(h, c)| (h, &mut c.inner))
-    }
-
-    pub fn _incoming(&mut self) -> impl Iterator<Item = (ConnectionHandle, Datagrams<'_>)> {
-        self.connections
-            .iter_mut()
-            .map(|(connection_handle, connection)| {
-                (*connection_handle, connection.inner.datagrams())
-            })
+    pub fn sessions_mut(&mut self) -> impl Iterator<Item = (&ConnectionHandle, &mut Session)> {
+        self.connections.iter_mut()
     }
 
     pub fn outgoing(&mut self) -> impl Iterator<Item = (Transmit, Bytes)> + '_ {
-        self.outbound.drain(..)
+        self.outbound.0.drain(..)
     }
 
     pub fn compute_next_timeout(&mut self) -> Option<Instant> {
@@ -214,7 +193,7 @@ impl Server {
                 // Created a new connection -- store it in the hashmap
                 self.connections.insert(
                     connection_handle,
-                    ConnectionWrapper {
+                    Session {
                         inner: connection,
                         request: Request::new(),
                     },
@@ -227,7 +206,7 @@ impl Server {
             Err(error) => {
                 // Failed to accept the connection -- possibly transmit back a response
                 if let Some(transmit) = error.response {
-                    push_transmit(transmit, &mut self.buf, &mut self.outbound);
+                    self.outbound.push(transmit, &mut self.buf);
                 }
 
                 Err(error.cause)
@@ -241,100 +220,3 @@ impl Server {
             .reserve(self.endpoint.config().get_max_udp_payload_size() as usize);
     }
 }
-
-impl ConnectionWrapper {
-    fn handle_process(
-        &mut self,
-        now: Instant,
-        buf: &mut Vec<u8>,
-        outbound: &mut Vec<(Transmit, Bytes)>,
-    ) {
-        // Update the webtransport connection request state machine
-        if self.inner.is_drained() == false {
-            'wt: loop {
-                match self.request.update(&mut self.inner) {
-                    Ok(RequestState::ConnectData(url)) => {
-                        println!("got connect data: {:?}", url);
-                        _ = self.request.respond(StatusCode::OK);
-                    }
-                    Ok(RequestState::ResponseSent(id)) => {
-                        println!("got stream id: {:?}", id);
-                        // TODO
-                    }
-                    Ok(RequestState::Finished) | Ok(RequestState::Waiting) => {
-                        // Nothing to do here
-                        break 'wt;
-                    }
-                    Err(e) => {
-                        println!("got error: {:?}", e);
-                        break 'wt;
-                    }
-                }
-            }
-        }
-
-        let mut transmit_ops = 0;
-
-        loop {
-            if let Some(transmit) = self.inner.poll_transmit(now, MAX_DATAGRAMS, buf) {
-                push_transmit(transmit, buf, outbound);
-                transmit_ops += 1;
-            } else {
-                // Nothing (left) to transmit, but still check timeouts
-                transmit_ops = MAX_TRANSMIT_OPS;
-            }
-
-            // Do this after every transmit (as transmits affect timers), and at least once
-            self.inner.handle_timeout(now);
-
-            if transmit_ops >= MAX_TRANSMIT_OPS {
-                break;
-            }
-        }
-    }
-}
-
-// Pushes a transmit to the outbound buffer, splitting it if necessary
-fn push_transmit(transmit: Transmit, buf: &mut Vec<u8>, outbound: &mut Vec<(Transmit, Bytes)>) {
-    let mut buffer = Bytes::copy_from_slice(&buf[..transmit.size]);
-
-    match transmit.segment_size {
-        // No separate segments -- just push the whole thing
-        None => outbound.push((transmit, buffer)),
-
-        // Multiple segments, so split and push them as sub-transmits
-        Some(segment_size) => {
-            while buffer.is_empty() == false {
-                let end = segment_size.min(buffer.len());
-                let contents = buffer.split_to(end);
-
-                outbound.push((
-                    Transmit {
-                        destination: transmit.destination,
-                        size: contents.len(),
-                        ecn: transmit.ecn,
-                        segment_size: None,
-                        src_ip: transmit.src_ip,
-                    },
-                    contents,
-                ));
-            }
-        }
-    };
-
-    buf.clear();
-}
-
-// // TODO: Wrap in connection?
-// pub fn close_recv_stream(recv_stream: &mut RecvStream) {
-//     _ = recv_stream.stop(0u32.into()); // Ignore ClosedStream errors
-// }
-//
-// // TODO: Wrap in connection?
-// pub fn close_send_stream(send_stream: &mut SendStream) {
-//     match send_stream.finish() {
-//         Ok(()) => (), // Everything worked fine
-//         Err(FinishError::Stopped(reason)) => _ = send_stream.reset(reason),
-//         Err(FinishError::ClosedStream) => (), // Already closed
-//     }
-// }
