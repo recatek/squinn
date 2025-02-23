@@ -1,6 +1,6 @@
-mod settings;
 mod connect;
 mod response;
+mod settings;
 
 use http::StatusCode;
 use quinn_proto::{Connection, StreamId};
@@ -8,9 +8,9 @@ use url::Url;
 
 use crate::webtransport::WebTransportError;
 
-use settings::Settings;
 use connect::Connect;
 use response::Response;
+use settings::Settings;
 
 const DATA_BUFFER_SIZE: usize = 128;
 
@@ -41,16 +41,18 @@ impl Request {
         }
     }
 
-    pub fn reset(&mut self) {
+    pub fn _reset(&mut self) {
         self.data_buf.clear();
         self.inner = RequestInner::Settings(Settings::new());
     }
 
     pub fn respond(&mut self, status: StatusCode) -> Result<(), WebTransportError> {
         match &mut self.inner {
-            RequestInner::Response(r) => Ok(r.start_response(&mut self.data_buf, status)),
-            _ => Err(WebTransportError::NotReadyToRespond),
+            RequestInner::Response(r) => r.start_response(&mut self.data_buf, status),
+            _ => Err(WebTransportError::NotReadyToRespond)?,
         }
+
+        Ok(())
     }
 
     pub fn update(
@@ -77,7 +79,7 @@ impl Request {
         }
 
         if let RequestInner::Response(ref mut state) = self.inner {
-            if let Some(session_id) = state.update(connection, &mut self.data_buf)? {
+            if let Some(session_id) = state.update(connection, &self.data_buf)? {
                 self.inner = RequestInner::Finished;
                 self.data_buf.clear();
                 return Ok(RequestState::ResponseSent(session_id));

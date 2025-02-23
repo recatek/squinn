@@ -25,13 +25,13 @@ impl Response {
     pub fn update(
         &mut self,
         connection: &mut Connection,
-        data_buf: &mut Vec<u8>,
+        data_response: &[u8],
     ) -> Result<Option<StreamId>, WebTransportError> {
-        if data_buf.is_empty() == false {
+        if data_response.is_empty() == false {
             let mut send_stream = connection.send_stream(self.send_id);
-            self.send_bytes += send_stream.write(&data_buf[self.send_bytes..])?;
+            self.send_bytes += send_stream.write(&data_response[self.send_bytes..])?;
 
-            if self.send_bytes >= data_buf.len() {
+            if self.send_bytes >= data_response.len() {
                 return Ok(Some(self.send_id));
             }
         }

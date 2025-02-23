@@ -4,11 +4,10 @@ use std::sync::LazyLock;
 use quinn_proto::{Connection, Dir, StreamId};
 use web_transport_proto::{Settings as SettingsData, SettingsError};
 
-use crate::webtransport::{WebTransportError};
-use crate::server::{close_send_stream, close_recv_stream};
+use crate::webtransport::WebTransportError;
 
 // This never changes at runtime, but is nondeterministic due to being HashMap-based.
-const SETTINGS_ENCODED: LazyLock<&[u8]> = LazyLock::new(|| encode_settings());
+static SETTINGS_ENCODED: LazyLock<&[u8]> = LazyLock::new(encode_settings);
 
 #[derive(Default)]
 pub struct Settings {
@@ -47,16 +46,16 @@ impl Settings {
         debug_assert!(self.send_done == false);
 
         if self.send_id.is_none() {
+            // There's no point at which we close this stream. If we error, we'll nuke the whole
+            // connection. If we succeed, the stream stays open for the whole connection lifetime.
             self.send_id = connection.streams().open(Dir::Uni);
         }
 
         if let Some(send_id) = self.send_id {
-            // We don't close on error since we'll just nuke the connection
             let mut send_stream = connection.send_stream(send_id);
             self.send_bytes += send_stream.write(&SETTINGS_ENCODED[self.send_bytes..])?;
 
             if self.send_bytes >= SETTINGS_ENCODED.len() {
-                close_send_stream(&mut send_stream);
                 return Ok(true);
             }
         }
@@ -72,11 +71,12 @@ impl Settings {
         debug_assert!(self.recv_done == false);
 
         if self.recv_id.is_none() {
+            // There's no point at which we close this stream. If we error, we'll nuke the whole
+            // connection. If we succeed, the stream stays open for the whole connection lifetime.
             self.recv_id = connection.streams().accept(Dir::Uni);
         }
 
         if let Some(recv_id) = self.recv_id {
-            // We don't close on error since we'll just nuke the connection
             let mut recv_stream = connection.recv_stream(recv_id);
             let recv_chunk = recv_stream
                 .read(true)
@@ -88,16 +88,12 @@ impl Settings {
 
             return match SettingsData::decode(&mut Cursor::new(&recv_buf)) {
                 Err(SettingsError::UnexpectedEnd) => Ok(false), // Keep trying
-                Err(e) => Err(e.into()), // No close -- we'll nuke the connection
+                Err(e) => Err(e.into()),
 
-                // Got what we wanted here
-                Ok(settings) => {
-                    close_recv_stream(&mut recv_stream);
-                    match settings.supports_webtransport() {
-                        0 => Err(WebTransportError::WebTransportUnsupported),
-                        _ => Ok(true), // We're done!
-                    }
-                }
+                Ok(settings) => match settings.supports_webtransport() {
+                    0 => Err(WebTransportError::WebTransportUnsupported),
+                    _ => Ok(true), // We're done!
+                },
             };
         }
 

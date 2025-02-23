@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::io::IoSliceMut;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -7,9 +7,8 @@ use bytes::{Bytes, BytesMut};
 use http::StatusCode;
 use quinn_proto::crypto::rustls::QuicServerConfig;
 use quinn_proto::{
-    AckFrequencyConfig, Connection, ConnectionError, ConnectionEvent, ConnectionHandle,
-    DatagramEvent, Datagrams, Endpoint, EndpointConfig, EndpointEvent, FinishError, IdleTimeout,
-    Incoming, RecvStream, SendStream, ServerConfig, Transmit, VarInt,
+    AckFrequencyConfig, Connection, ConnectionError, ConnectionHandle, DatagramEvent, Datagrams,
+    Endpoint, EndpointConfig, EndpointEvent, IdleTimeout, Incoming, ServerConfig, Transmit, VarInt,
 };
 use quinn_udp::RecvMeta;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
@@ -24,6 +23,9 @@ pub const ALPN: &[u8] = b"h3";
 /// The maximum of datagrams a Server will produce via `poll_transmit`
 const MAX_DATAGRAMS: usize = 10;
 
+/// The maximum number of transmit loop iterations for a single connection.
+const MAX_TRANSMIT_OPS: usize = 3;
+
 /// Maximum ack delay (adjust for longer periods between recv calls).
 const MAX_ACK_DELAY: Duration = Duration::from_millis(50);
 
@@ -37,9 +39,8 @@ const BATCH_COUNT: usize = 1;
 
 pub struct Server {
     endpoint: Endpoint,
-    outbound: VecDeque<(Transmit, Bytes)>,
+    outbound: Vec<(Transmit, Bytes)>,
     connections: HashMap<ConnectionHandle, ConnectionWrapper>,
-    connection_events: HashMap<ConnectionHandle, VecDeque<ConnectionEvent>>,
     endpoint_events: Vec<(ConnectionHandle, EndpointEvent)>,
 
     buf: Vec<u8>, // Reusable byte buffer to save on allocations
@@ -79,9 +80,8 @@ impl Server {
                 true,
                 None,
             ),
-            outbound: VecDeque::new(),
+            outbound: Vec::new(),
             connections: HashMap::new(),
-            connection_events: HashMap::new(),
             endpoint_events: Vec::new(),
             buf: Vec::new(),
         };
@@ -125,69 +125,27 @@ impl Server {
                 }
             }
             Some(DatagramEvent::ConnectionEvent(connection_handle, event)) => {
-                self.connection_events
-                    .entry(connection_handle)
-                    .or_default()
-                    .push_back(event);
+                if let Some(connection) = self.connections.get_mut(&connection_handle) {
+                    connection.inner.handle_event(event);
+                } else {
+                    println!("missing connection: {:?}", connection_handle);
+                }
             }
             Some(DatagramEvent::Response(transmit)) => {
-                let send_buf = &self.buf[..transmit.size];
-                self.outbound.extend(split_transmit(transmit, send_buf));
+                push_transmit(transmit, &mut self.buf, &mut self.outbound);
             }
             _ => {} // There may be no event to handle
         }
     }
 
     pub fn handle_process(&mut self, now: Instant) {
-        let max = MAX_DATAGRAMS;
-
         self.prepare_response_buf();
 
         for (connection_handle, connection) in &mut self.connections {
-            // TODO: Quinn does this after transmit (in a ping-pong between the two), see below...
-            connection.inner.handle_timeout(now);
-
-            for (_, mut events) in self.connection_events.drain() {
-                for event in events.drain(..) {
-                    connection.inner.handle_event(event);
-                }
-            }
-
-            if connection.inner.is_drained() == false {
-                'wt: loop {
-                    println!("webtransport...");
-                    match connection.request.update(&mut connection.inner) {
-                        Ok(RequestState::ConnectData(url)) => {
-                            println!("got connect data: {:?}", url);
-                            _ = connection.request.respond(StatusCode::OK);
-                        }
-                        Ok(RequestState::ResponseSent(id)) => {
-                            println!("got stream id: {:?}", id);
-                            // TODO
-                        }
-                        Ok(RequestState::Finished) | Ok(RequestState::Waiting) => {
-                            // Nothing to do here
-                            break 'wt;
-                        }
-                        Err(e) => {
-                            println!("got error: {:?}", e);
-                            break 'wt;
-                        }
-                    }
-                }
-            }
+            connection.handle_process(now, &mut self.buf, &mut self.outbound);
 
             while let Some(event) = connection.inner.poll_endpoint_events() {
                 self.endpoint_events.push((*connection_handle, event));
-            }
-
-            // TODO: Transmit may reset timers, and timers may cause more to reset.
-            //       Look at the drive_timer function in quinn's connection.rs for more info.
-            while let Some(transmit) = connection.inner.poll_transmit(now, max, &mut self.buf) {
-                let send_buf = &self.buf[..transmit.size];
-                self.outbound.extend(split_transmit(transmit, send_buf));
-
-                self.buf.clear(); // Need to clear here to reuse the buffer
             }
         }
 
@@ -269,9 +227,7 @@ impl Server {
             Err(error) => {
                 // Failed to accept the connection -- possibly transmit back a response
                 if let Some(transmit) = error.response {
-                    let size = transmit.size;
-                    self.outbound
-                        .extend(split_transmit(transmit, &self.buf[..size]));
+                    push_transmit(transmit, &mut self.buf, &mut self.outbound);
                 }
 
                 Err(error.cause)
@@ -281,51 +237,104 @@ impl Server {
 
     fn prepare_response_buf(&mut self) {
         self.buf.clear();
+        self.buf
+            .reserve(self.endpoint.config().get_max_udp_payload_size() as usize);
+    }
+}
 
-        let max_size = self.endpoint.config().get_max_udp_payload_size() as usize;
-        if self.buf.capacity() < max_size {
-            self.buf.reserve(max_size - self.buf.capacity());
+impl ConnectionWrapper {
+    fn handle_process(
+        &mut self,
+        now: Instant,
+        buf: &mut Vec<u8>,
+        outbound: &mut Vec<(Transmit, Bytes)>,
+    ) {
+        // Update the webtransport connection request state machine
+        if self.inner.is_drained() == false {
+            'wt: loop {
+                match self.request.update(&mut self.inner) {
+                    Ok(RequestState::ConnectData(url)) => {
+                        println!("got connect data: {:?}", url);
+                        _ = self.request.respond(StatusCode::OK);
+                    }
+                    Ok(RequestState::ResponseSent(id)) => {
+                        println!("got stream id: {:?}", id);
+                        // TODO
+                    }
+                    Ok(RequestState::Finished) | Ok(RequestState::Waiting) => {
+                        // Nothing to do here
+                        break 'wt;
+                    }
+                    Err(e) => {
+                        println!("got error: {:?}", e);
+                        break 'wt;
+                    }
+                }
+            }
+        }
+
+        let mut transmit_ops = 0;
+
+        loop {
+            if let Some(transmit) = self.inner.poll_transmit(now, MAX_DATAGRAMS, buf) {
+                push_transmit(transmit, buf, outbound);
+                transmit_ops += 1;
+            } else {
+                // Nothing (left) to transmit, but still check timeouts
+                transmit_ops = MAX_TRANSMIT_OPS;
+            }
+
+            // Do this after every transmit (as transmits affect timers), and at least once
+            self.inner.handle_timeout(now);
+
+            if transmit_ops >= MAX_TRANSMIT_OPS {
+                break;
+            }
         }
     }
 }
 
-fn split_transmit(transmit: Transmit, buffer: &[u8]) -> Vec<(Transmit, Bytes)> {
-    let mut buffer = Bytes::copy_from_slice(buffer);
-    let segment_size = match transmit.segment_size {
-        Some(segment_size) => segment_size,
-        _ => return vec![(transmit, buffer)],
+// Pushes a transmit to the outbound buffer, splitting it if necessary
+fn push_transmit(transmit: Transmit, buf: &mut Vec<u8>, outbound: &mut Vec<(Transmit, Bytes)>) {
+    let mut buffer = Bytes::copy_from_slice(&buf[..transmit.size]);
+
+    match transmit.segment_size {
+        // No separate segments -- just push the whole thing
+        None => outbound.push((transmit, buffer)),
+
+        // Multiple segments, so split and push them as sub-transmits
+        Some(segment_size) => {
+            while buffer.is_empty() == false {
+                let end = segment_size.min(buffer.len());
+                let contents = buffer.split_to(end);
+
+                outbound.push((
+                    Transmit {
+                        destination: transmit.destination,
+                        size: contents.len(),
+                        ecn: transmit.ecn,
+                        segment_size: None,
+                        src_ip: transmit.src_ip,
+                    },
+                    contents,
+                ));
+            }
+        }
     };
 
-    let mut transmits = Vec::new();
-    while buffer.is_empty() == false {
-        let end = segment_size.min(buffer.len());
-        let contents = buffer.split_to(end);
-
-        transmits.push((
-            Transmit {
-                destination: transmit.destination,
-                size: contents.len(),
-                ecn: transmit.ecn,
-                segment_size: None,
-                src_ip: transmit.src_ip,
-            },
-            contents,
-        ));
-    }
-
-    transmits
+    buf.clear();
 }
 
-// TODO: Wrap in connection?
-pub fn close_recv_stream(recv_stream: &mut RecvStream) {
-    _ = recv_stream.stop(0u32.into()); // Ignore ClosedStream errors
-}
-
-// TODO: Wrap in connection?
-pub fn close_send_stream(send_stream: &mut SendStream) {
-    match send_stream.finish() {
-        Ok(()) => (), // Everything worked fine
-        Err(FinishError::Stopped(reason)) => _ = send_stream.reset(reason),
-        Err(FinishError::ClosedStream) => (), // Already closed
-    }
-}
+// // TODO: Wrap in connection?
+// pub fn close_recv_stream(recv_stream: &mut RecvStream) {
+//     _ = recv_stream.stop(0u32.into()); // Ignore ClosedStream errors
+// }
+//
+// // TODO: Wrap in connection?
+// pub fn close_send_stream(send_stream: &mut SendStream) {
+//     match send_stream.finish() {
+//         Ok(()) => (), // Everything worked fine
+//         Err(FinishError::Stopped(reason)) => _ = send_stream.reset(reason),
+//         Err(FinishError::ClosedStream) => (), // Already closed
+//     }
+// }

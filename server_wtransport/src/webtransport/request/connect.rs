@@ -23,11 +23,12 @@ impl Connect {
         recv_buf: &mut Vec<u8>,
     ) -> Result<Option<(Url, StreamId)>, WebTransportError> {
         if self.stream_id.is_none() {
-            self.stream_id = connection.streams().accept(Dir::Bi); // For response
+            // There's no point at which we close this stream. If we error, we'll nuke the whole
+            // connection. If we succeed, the stream stays open for the whole connection lifetime.
+            self.stream_id = connection.streams().accept(Dir::Bi); // Bidirectional for response
         }
 
         if let Some(recv_id) = self.stream_id {
-            // We don't close on error since we'll just nuke the connection
             let mut recv_stream = connection.recv_stream(recv_id);
             let recv_chunk = recv_stream
                 .read(true)
@@ -38,14 +39,10 @@ impl Connect {
             recv_buf.extend_from_slice(&recv_chunk.bytes);
 
             return match ConnectRequest::decode(&mut Cursor::new(&recv_buf)) {
-                Err(ConnectError::UnexpectedEnd) => Ok(None),  // Keep trying
+                Err(ConnectError::UnexpectedEnd) => Ok(None), // Keep trying
                 Err(e) => Err(e.into()),
 
-                // Got what we wanted here
-                Ok(connect) => {
-                    // The stream stays open for the duration of the connection
-                    Ok(Some((connect.url, recv_id)))
-                }
+                Ok(connect) => Ok(Some((connect.url, recv_id))),
             };
         }
 

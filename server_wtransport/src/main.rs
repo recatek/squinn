@@ -4,7 +4,7 @@ mod webtransport;
 
 use std::fs::File;
 use std::io::{BufReader, ErrorKind};
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::SocketAddr;
 use std::str;
 use std::time::Instant;
 
@@ -17,7 +17,7 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use crate::server::Server;
 
 fn main() {
-    simple_logger::init().unwrap();
+    //simple_logger::init().unwrap();
 
     let addr: SocketAddr = "[::]:4443".parse().unwrap();
 
@@ -45,9 +45,12 @@ fn main() {
 
     loop {
         let now = Instant::now();
-        let next_timeout = server.compute_next_timeout().map(|t| t.saturating_duration_since(now));
+        let next_timeout = server
+            .compute_next_timeout()
+            .map(|t| t.saturating_duration_since(now));
         poll.poll(&mut events, next_timeout).unwrap();
 
+        let now = Instant::now(); // Need to update this after polling
         while events.is_empty() == false {
             match sock_mio.try_io(|| sock_quic.recv((&sock_mio).into(), &mut iovs, &mut metas)) {
                 Ok(count) => {
