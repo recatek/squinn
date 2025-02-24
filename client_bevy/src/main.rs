@@ -9,9 +9,14 @@ use bevy::prelude::*;
 
 use bevy_async_task::AsyncTaskRunner;
 use url::Url;
-use web_transport_wasm::ClientBuilder;
+use web_transport::ClientBuilder;
 
 const SERVER_URL: &str = "https://127.0.0.1:4443";
+
+#[cfg(target_arch = "wasm32")]
+const CERT_HEX_PATH: &str = "../cert/localhost.hex";
+#[cfg(not(target_arch = "wasm32"))]
+const CERT_HEX_PATH: &str = "../../cert/localhost.hex";
 
 #[derive(Resource)]
 struct Client {
@@ -47,7 +52,8 @@ async fn run_client(cert_hex_str: String) -> Result<(), Box<dyn Error + Send + S
         let hashes = vec![decode_hex(cert_hex_str.trim_end()).expect("failed to decode hex")];
         let client = ClientBuilder::new()
             .with_unreliable(true)
-            .with_server_certificate_hashes(hashes);
+            .with_server_certificate_hashes(hashes)
+            .expect("failed to create server");
         let server_url = Url::parse(SERVER_URL).expect("failed to parse server url");
 
         let mut session = client.connect(&server_url).await?;
@@ -75,7 +81,7 @@ fn client_system(
     mut task_runner: AsyncTaskRunner<'_, Result<(), Box<dyn Error + Send + Sync>>>,
 ) {
     if let Err(err) = check_load_state(assets.load_state(&client.cert)) {
-        panic!("failed to load file cert/localhost.hex: {:?}", err);
+        panic!("failed to load localhost.hex: {:?}", err);
     }
 
     if *running == false && task_runner.is_idle() {
@@ -94,16 +100,13 @@ fn client_system(
 }
 
 fn load_certs(mut commands: Commands, assets: Res<AssetServer>) {
-    let handle: Handle<StringAsset> = assets.load("cert/localhost.hex");
+    let handle: Handle<StringAsset> = assets.load(CERT_HEX_PATH);
     commands.insert_resource(Client { cert: handle });
 }
 
 fn main() {
     let mut app = App::new();
-    app.add_plugins(DefaultPlugins.set(AssetPlugin {
-        file_path: "".into(),
-        ..Default::default()
-    }))
+    app.add_plugins(DefaultPlugins)
     .add_systems(Startup, load_certs)
     .add_systems(Update, client_system)
     .init_asset::<StringAsset>()

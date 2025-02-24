@@ -8,7 +8,7 @@ bevy = "0.15"
 bevy_async_task = "0.4"
 
 url = "2.5"
-web-transport-wasm = "0.4"
+web-transport = { git = "https://github.com/kixelated/web-transport-rs" }
 
 [lints]
 workspace = true
