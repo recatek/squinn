@@ -54,7 +54,9 @@ async fn run_client(cert_hex_str: String) -> Result<(), Box<dyn Error + Send + S
             .with_unreliable(true)
             .with_server_certificate_hashes(hashes)
             .expect("failed to create server");
-        let server_url = Url::parse(SERVER_URL).expect("failed to parse server url");
+
+        let mut server_url = Url::parse(SERVER_URL).expect("failed to parse server url");
+        server_url.set_path("test_path"); // Can use this for a connection data token
 
         let mut session = client.connect(&server_url).await?;
         info!("connected");
