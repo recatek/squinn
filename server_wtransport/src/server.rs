@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::io::IoSliceMut;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -25,11 +24,6 @@ const MAX_ACK_DELAY: Duration = Duration::from_millis(50);
 
 /// Max idle timeout for clients.
 const MAX_IDLE_TIMEOUT_MS: VarInt = VarInt::from_u32(10_000);
-
-#[cfg(target_os = "linux")]
-const BATCH_COUNT: usize = 32;
-#[cfg(target_os = "windows")]
-const BATCH_COUNT: usize = 1;
 
 pub struct Server {
     endpoint: Endpoint,
@@ -78,24 +72,11 @@ impl Server {
         Ok(server)
     }
 
-    pub fn create_buffers(
-        &self,
-        gro_segments: usize,
-    ) -> ([IoSliceMut<'static>; BATCH_COUNT], [RecvMeta; BATCH_COUNT]) {
-        let max_udp_payload_size = self.endpoint.config().get_max_udp_payload_size() as usize;
-        let chunk_size = gro_segments * max_udp_payload_size.min(u16::MAX.into());
-        let total_bytes = chunk_size * BATCH_COUNT;
-
-        let buf = Box::leak(vec![0; total_bytes].into_boxed_slice());
-        let mut chunks = buf.chunks_mut(chunk_size).map(IoSliceMut::new);
-
-        let iovs = std::array::from_fn(|_| chunks.next().unwrap());
-        let metas = [RecvMeta::default(); BATCH_COUNT];
-
-        (iovs, metas)
+    pub fn get_max_udp_payload_size(&self) -> u64 {
+        self.endpoint.config().get_max_udp_payload_size()
     }
 
-    pub fn handle_recv(&mut self, now: Instant, meta: &RecvMeta, data: BytesMut) {
+    pub fn handle_recv(&mut self, now: Instant, data: BytesMut, meta: &RecvMeta) {
         self.prepare_response_buf();
 
         let event = self.endpoint.handle(

@@ -1,6 +1,7 @@
 mod outbound;
 mod server;
 mod session;
+mod socket;
 mod util;
 
 mod webtransport;
@@ -11,38 +12,30 @@ use std::net::SocketAddr;
 use std::str;
 use std::time::Instant;
 
-use bytes::BytesMut;
-use mio::{net::UdpSocket, Events, Interest, Poll, Token};
-use quinn_udp::{Transmit, UdpSocketState};
+use mio::{Events, Interest, Poll, Token};
 
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
 use crate::server::Server;
+use crate::socket::Socket;
+
+const TOKEN_RECV: Token = Token(0);
 
 fn main() {
     //simple_logger::init().unwrap();
 
+    let (certs, key) = read_certs();
+    let mut server = Server::new(certs, key).expect("failed to create server");
+
     let addr: SocketAddr = "127.0.0.1:4443".parse().unwrap();
+    let mut socket = Socket::new(addr, server.get_max_udp_payload_size() as usize);
 
     let mut poll = Poll::new().unwrap();
     let mut events = Events::with_capacity(64);
 
-    let mut sock_mio = UdpSocket::bind(addr).unwrap();
-    let sock_quic = UdpSocketState::new((&sock_mio).into()).unwrap();
-
-    let sock_ref = (&sock_mio).into();
-    #[cfg(target_os = "windows")]
-    sock_quic.set_gro(sock_ref, true).unwrap();
-    #[cfg(target_os = "linux")]
-    sock_quic.set_recv_timestamping(sock_ref, true).unwrap();
-
     poll.registry()
-        .register(&mut sock_mio, Token(0), Interest::READABLE)
+        .register(&mut socket, TOKEN_RECV, Interest::READABLE)
         .unwrap();
-
-    let (certs, key) = read_certs();
-    let mut server = Server::new(certs, key).expect("failed to create server");
-    let (mut iovs, mut metas) = server.create_buffers(sock_quic.gro_segments());
 
     println!("listening on {}...", addr);
 
@@ -51,24 +44,27 @@ fn main() {
         let next_timeout = server
             .compute_next_timeout()
             .map(|t| t.saturating_duration_since(now));
-        poll.poll(&mut events, next_timeout).unwrap();
 
-        let now = Instant::now(); // Need to update this after polling
-        while events.is_empty() == false {
-            match sock_mio.try_io(|| sock_quic.recv((&sock_mio).into(), &mut iovs, &mut metas)) {
-                Ok(count) => {
-                    for (meta, buf) in metas.iter().zip(iovs.iter()).take(count) {
-                        let mut data: BytesMut = buf[0..meta.len].into();
-                        while data.is_empty() == false {
-                            let buf = data.split_to(meta.stride.min(data.len()));
-                            println!("recv: {}B", buf.len());
-                            server.handle_recv(now, meta, buf)
-                        }
+        if let Err(err) = poll.poll(&mut events, next_timeout) {
+            if err.kind() == ErrorKind::Interrupted {
+                continue;
+            }
+            panic!("poll error: {}", err);
+        }
+
+        let now = Instant::now();
+        for event in events.iter() {
+            match event.token() {
+                TOKEN_RECV => {
+                    match socket.recv_all(|bytes, meta| {
+                        println!("recv: {}B", bytes.len());
+                        server.handle_recv(now, bytes, meta)
+                    }) {
+                        Ok(()) => {}
+                        Err(e) => println!("recv error: {:?}", e),
                     }
                 }
-                Err(e) if e.kind() == ErrorKind::WouldBlock => break,
-                Err(e) if e.kind() == ErrorKind::ConnectionReset => continue,
-                Err(e) => panic!("recv error: {:?}", e),
+                _ => unreachable!(),
             }
         }
 
@@ -107,16 +103,8 @@ fn main() {
 
         // Send all the outgoing traffic
         for (transmit, buffer) in server.outgoing() {
-            let transmit = Transmit {
-                destination: transmit.destination,
-                ecn: transmit.ecn.map(util::udp_ecn),
-                contents: &buffer,
-                segment_size: transmit.segment_size,
-                src_ip: transmit.src_ip,
-            };
-
             println!("send: {}B", buffer.len());
-            match sock_mio.try_io(|| sock_quic.try_send((&sock_mio).into(), &transmit)) {
+            match socket.try_send(transmit, buffer) {
                 Ok(()) => (),
                 Err(e) => println!("send error: {:?}", e),
             }

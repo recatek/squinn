@@ -109,10 +109,10 @@ fn load_certs(mut commands: Commands, assets: Res<AssetServer>) {
 fn main() {
     let mut app = App::new();
     app.add_plugins(DefaultPlugins)
-    .add_systems(Startup, load_certs)
-    .add_systems(Update, client_system)
-    .init_asset::<StringAsset>()
-    .init_asset_loader::<StringAssetLoader>();
+        .add_systems(Startup, load_certs)
+        .add_systems(Update, client_system)
+        .init_asset::<StringAsset>()
+        .init_asset_loader::<StringAssetLoader>();
     app.run();
 }
 
